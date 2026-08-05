@@ -1,0 +1,91 @@
+name: Manual RDP via Tailscale
+
+# Manual trigger only — you click "Run workflow", use the machine, and it
+# ends automatically after the timeout. No auto re-trigger, no loop.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  rdp:
+    runs-on: windows-2025
+    # Max allowed runtime for this job (6 hours + small buffer for other steps).
+    timeout-minutes: 370
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Enable RDP while keeping NLA security enabled
+        run: |
+          # Enable remote desktop connections without disabling Network Level
+          # Authentication (NLA).
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Note: UserAuthentication and SecurityLayer are intentionally left
+          # untouched so NLA stays enabled (safer for a machine exposed on
+          # the network).
+
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP user with password from Secrets (not hardcoded)
+        run: |
+          # You must add a repo secret named RDP_PASSWORD with a strong value:
+          # Settings -> Secrets and variables -> Actions -> New repository secret
+          $u = "rdpuser"
+          $securePass = ConvertTo-SecureString "${{ secrets.RDP_PASSWORD }}" -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $u -Password $securePass -AccountNeverExpires | Out-Null
+          } else {
+              Set-LocalUser -Name $u -Password $securePass
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member $u -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -ErrorAction SilentlyContinue
+
+      - name: Install and start Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile "$env:TEMP\ts.msi"
+          Start-Process msiexec.exe -ArgumentList "/i", "$env:TEMP\ts.msi", "/quiet", "/norestart" -Wait
+          Remove-Item "$env:TEMP\ts.msi" -Force
+
+          # You must add a repo secret named TAILSCALE_AUTH_KEY (get one at
+          # tailscale.com/admin/settings/keys)
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-runner-${{ github.run_number }} `
+            --accept-routes
+
+      - name: Print connection info
+        run: |
+          $tsIP = $null; $r = 0
+          while (-not $tsIP -and $r -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $r++
+          }
+          if (-not $tsIP) {
+              Write-Error "Failed to get Tailscale IP"
+              exit 1
+          }
+          Write-Host "=================================================="
+          Write-Host "Tailscale IP  : $tsIP"
+          Write-Host "Username      : rdpuser"
+          Write-Host "Password      : (value you set in the RDP_PASSWORD secret)"
+          Write-Host "=================================================="
+          "## Connection info`n- **IP:** ``$tsIP```n- **Username:** ``rdpuser``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Keep the job alive until you're done (manual, single run)
+        run: |
+          # Duration in minutes. 360 minutes = 6 full hours.
+          $minutes = 360
+          for ($i = 1; $i -le $minutes; $i++) {
+              $remaining = $minutes - $i
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Time remaining: $remaining minute(s)"
+              Start-Sleep -Seconds 60
+          }
+          Write-Host "Session finished. The job will stop automatically now."
